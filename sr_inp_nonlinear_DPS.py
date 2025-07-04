@@ -52,18 +52,18 @@ def dmplug(model, scheduler, logdir, img='00000', eta=0, lr=1e-2, dataset='celeb
     # DMPlug
     Z = torch.randn((1, 3, img_model_config['image_size'], img_model_config['image_size']), device=device, dtype=dtype, requires_grad=True)
     criterion = torch.nn.MSELoss().to(device)
-    params_group1 = {'params': Z, 'lr': lr}
-    optimizer = torch.optim.Adam([params_group1])
 
-    epochs = 1000 # SR, inpainting: 5,000, nonlinear deblurring: 10,000
+    epochs = 40 # SR, inpainting: 5,000, nonlinear deblurring: 10,000
     psnrs = []
     ssims = []
     losses = []
     lpipss = []
     loss_fn_alex = lpips.LPIPS(net='alex').to(device)
     for iterator in tqdm(range(epochs)):
+
+        img_trajectory = [Z.detach().clone()]
+
         model.eval()
-        optimizer.zero_grad()
 
         if iterator % 10 == 0:
             output = torch.clamp(Z, -1, 1)
@@ -79,19 +79,56 @@ def dmplug(model, scheduler, logdir, img='00000', eta=0, lr=1e-2, dataset='celeb
             else:
                 noise_pred = model(x_t, t)
             noise_pred = noise_pred[:, :3]
-            if i == 0:
-                x_t = scheduler.step(noise_pred, tt, Z, return_dict=True, use_clipped_model_output=True, eta=eta).prev_sample
+
+            input = Z if i == 0 else x_t
+            ddim_output = scheduler.step(noise_pred, tt, input, return_dict=True, use_clipped_model_output=True, eta=eta)
+
+            x_t = ddim_output.prev_sample
+            x_0 = ddim_output.pred_original_sample
+
+            # dps step
+            if measure_config['operator']['name'] == 'inpainting':
+                loss = criterion(operator.forward(x_0, mask=mask), y_n)**0.5
             else:
-                x_t = scheduler.step(noise_pred, tt, x_t, return_dict=True, use_clipped_model_output=True, eta=eta).prev_sample
+                loss = criterion(operator.forward(x_0), y_n)**0.5
+
+            loss_grad = torch.autograd.grad(outputs=loss, inputs=input, retain_graph=True)[0]
+            #if i != len(scheduler.timesteps) - 1:
+            print("Time", tt, "DPS_GRAD", torch.linalg.norm(loss_grad).item())
+            x_t = x_t - 10000 * loss_grad
+
+            if iterator % 10 == 0:
+                output = torch.clamp(x_t, -1, 1)
+                output_numpy = output.detach().cpu().squeeze().numpy()
+                output_numpy = (output_numpy + 1) / 2
+                output_numpy = np.transpose(output_numpy, (1, 2, 0))
+                plt.imsave(os.path.join(logdir, f"xt_{iterator}_{i}.png"), output_numpy)
+
+            x_t = x_t.detach().requires_grad_(True)
+            img_trajectory.append(x_t.detach().clone())
+
+        img_trajectory[-1] = y_n # TODO: modify for inpainting
+
+
+        for i, tt in enumerate(reversed(scheduler.timesteps)):     
+
+            denoised_img = img_trajectory[-i-1]
+            noisy_img = img_trajectory[-i-2]
+            
+            if i == 0:
+                operator_ = operator
+            else:
+                operator_ = None
+
+            noisy_img = forward_optimization(noisy_img, denoised_img, operator_, model, tt, scheduler, device, eta, criterion, max_iters=10)
+            
+            img_trajectory[-i-2] = noisy_img
+
+        print("    CHANGE: ", torch.norm(Z - img_trajectory[0].detach().clone()))
+
+        Z = img_trajectory[0].detach().clone().requires_grad_()
 
         output = torch.clamp(x_t, -1, 1)
-        if measure_config['operator']['name'] == 'inpainting':
-            loss = criterion(operator.forward(output, mask=mask), y_n)
-        else:
-            loss = criterion(operator.forward(output), y_n)
-        loss.backward()
-        optimizer.step()
-        losses.append(loss.item())
 
         with torch.no_grad():
             output_numpy = output.detach().cpu().squeeze().numpy()
@@ -129,6 +166,37 @@ def dmplug(model, scheduler, logdir, img='00000', eta=0, lr=1e-2, dataset='celeb
     ssim_res = np.max(ssims)
     lpips_res = np.min(lpipss)
     print('PSNR: {}, SSIM: {}, LPIPS: {}'.format(psnr_res, ssim_res, lpips_res))
+
+def forward_optimization(noisy_img, denoised_img, operator_, model, tt, scheduler, device, eta, criterion, max_iters=10):
+    """
+    Forward optimization step for DMPlug.
+    """
+    t = (torch.ones(1) * tt).cuda()
+
+    opt_var = noisy_img.detach().clone().requires_grad_()
+    optimizer = torch.optim.AdamW([opt_var], lr=1e-1)
+
+    for _ in range(max_iters):
+        optimizer.zero_grad()
+    
+        noise_pred = model(opt_var, t)
+        noise_pred = noise_pred[:, :3]
+
+        ddim_output = scheduler.step(noise_pred, tt, opt_var, return_dict=True, use_clipped_model_output=True, eta=eta).prev_sample
+
+        #if measure_config['operator']['name'] == 'inpainting':
+        #    loss = criterion(operator.forward(x_0, mask=mask), y_n)**0.5 # TODO: modify for inpainting
+        if operator_ is not None:
+            loss = criterion(operator_.forward(ddim_output), denoised_img)**0.5
+        else:
+            loss = criterion(ddim_output, denoised_img)**0.5
+
+        #print("Time", tt, "LOSS", loss.item())
+
+        loss.backward()
+        optimizer.step()
+
+    return opt_var.detach().clone()
 
 def get_parser():
     parser = argparse.ArgumentParser()
