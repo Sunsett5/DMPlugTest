@@ -10,6 +10,7 @@ from guided_diffusion.unet import create_model
 from ddim_sampler import *
 import shutil
 import lpips
+from tqdm import tqdm
 
 def load_yaml(file_path: str) -> dict:
     with open(file_path) as f:
@@ -73,10 +74,11 @@ def dmplug(model, scheduler, logdir, img='00000', eta=0, lr=1e-1, dataset='celeb
             else:
                 noise_pred = model(x_t, t)
             noise_pred = noise_pred[:, :3]
-            if i == 0:
-                x_t = scheduler.step(noise_pred, tt, Z, return_dict=True, use_clipped_model_output=True, eta=eta).prev_sample
-            else:
-                x_t = scheduler.step(noise_pred, tt, x_t, return_dict=True, use_clipped_model_output=True, eta=eta).prev_sample
+            
+            input = Z if i == 0 else x_t
+            ddim_output = scheduler.step(noise_pred, tt, input, return_dict=True, use_clipped_model_output=True, eta=eta)
+            x_t = ddim_output.prev_sample
+            x_0 = ddim_output.pred_original_sample
 
         output = torch.clamp(x_t, -1, 1)
         if measure_config['operator']['name'] == 'inpainting':
@@ -109,7 +111,7 @@ def dmplug(model, scheduler, logdir, img='00000', eta=0, lr=1e-1, dataset='celeb
         return loss
 
     epochs = 300  # SR, inpainting, nonlinear deblurring: 300
-    for iterator in range(epochs):
+    for iterator in tqdm(range(epochs)):
         optimizer.step(closure)
 
     plt.imsave(os.path.join(logdir, "rec_img.png"), best_img[0])
