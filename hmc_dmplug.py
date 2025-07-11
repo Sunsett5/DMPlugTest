@@ -18,7 +18,7 @@ def load_yaml(file_path: str) -> dict:
         config = yaml.load(f, Loader=yaml.FullLoader)
     return config
 
-def dmplug(model, scheduler, logdir, img='00000', eta=0, tau=0.1, epsilon=0.01, zeta=10, cutoff=100, dataset='celeba',img_model_config=None,task_config=None,device='cuda'):
+def dmplug(model, scheduler, logdir, img='00000', eta=0, tau=0.1, epsilon=0.01, sigma_y=1, m=1, cutoff=100, dataset='celeba',img_model_config=None,task_config=None,device='cuda'):
     dtype = torch.float32
     gt_img_path = './data/{}/{}.png'.format(dataset,img)
     gt_img = Image.open(gt_img_path).convert("RGB")
@@ -55,7 +55,7 @@ def dmplug(model, scheduler, logdir, img='00000', eta=0, tau=0.1, epsilon=0.01, 
     Z = torch.randn((1, 3, img_model_config['image_size'], img_model_config['image_size']), device=device, dtype=dtype, requires_grad=True)
     sse = torch.nn.MSELoss(reduction='sum').to(device)
 
-    epochs = 300 # SR, inpainting: 5,000, nonlinear deblurring: 10,000
+    epochs = 120 # SR, inpainting: 5,000, nonlinear deblurring: 10,000
     L = max(1,math.floor(tau/epsilon))
     psnrs = []
     ssims = []
@@ -63,51 +63,59 @@ def dmplug(model, scheduler, logdir, img='00000', eta=0, tau=0.1, epsilon=0.01, 
     lpipss = []
     loss_fn_alex = lpips.LPIPS(net='alex').to(device)
     accepted = 0
-    sig_p = 1
 
     
-    for iterator in tqdm(range(epochs)):
-        zeta *= 1.02
+    for iterator in tqdm(range(1, epochs)):
+
+        if iterator % 10 == 0:
+            sigma_y = sigma_y * 0.8
+
+        if iterator == 20:
+            tau = tau * 0.001
+            epsilon = epsilon * 0.001
+            
+
         # initialize momentum
-        p = torch.randn_like(Z, device=device, dtype=dtype) * sig_p
-        if iterator == 0:
-            output, measurement_err, _ = ddim_denoise(model, scheduler, Z, eta, measure_config, operator, y_n, sse, mask)
-            H = zeta * measurement_err.detach() + (1/2)* torch.sum(p * p, dim=(1, 2, 3))
+        p = torch.randn_like(Z, device=device, dtype=dtype) * math.sqrt(m)
+        output, measurement_err, _ = ddim_denoise(model, scheduler, Z, eta, measure_config, operator, y_n, sse, mask)
+        #print('Initial error1', (1/2) * torch.sum(Z**2, dim=(1, 2, 3)).item(), 'error2', (1/(2 * sigma_y**2)) * measurement_err.detach().item(), 'error3', ((1/2)* torch.sum(p * p, dim=(1, 2, 3)) * m**(-1)).item())
+        H = (1/2) * torch.sum(Z**2, dim=(1, 2, 3)) + (1/(2 * sigma_y**2)) * measurement_err.detach() + (1/2)* torch.sum(p * p, dim=(1, 2, 3)) * m**(-1)
 
         Z_proposal = Z.detach().clone().requires_grad_(True)
 
         p_original = p.detach().clone()
         p_norm = torch.linalg.norm(p_original).item()
 
+        output, measurement_err, measurement_grad = ddim_denoise(model, scheduler, Z_proposal, eta, measure_config, operator, y_n, sse, mask)
+
+        # update momentum
+        p = p - (epsilon / 2) * (Z_proposal.detach() + 1/(sigma_y**2) * measurement_grad)
+
         for l in range(L):
-        
-            output, measurement_err, measurement_grad = ddim_denoise(model, scheduler, Z_proposal, eta, measure_config, operator, y_n, sse, mask)
 
-            # update momentum
-            p = p - (epsilon / 2) * (Z_proposal.detach() + zeta * measurement_grad)
-
-            Z_proposal = Z_proposal + epsilon * p 
+            Z_proposal = Z_proposal + epsilon * m**(-1) * p 
             Z_proposal = Z_proposal.detach().requires_grad_(True)
 
             output, measurement_err, measurement_grad = ddim_denoise(model, scheduler, Z_proposal, eta, measure_config, operator, y_n, sse, mask)
 
-            p = p - (epsilon / 2) * (Z_proposal.detach() + zeta * measurement_grad)
+            p = p - epsilon * (Z_proposal.detach() + 1/(sigma_y**2) * measurement_grad)
 
-        norm_change = torch.linalg.norm(p - p_original).item()
-        print('leap', l,  'norm', norm_change, 'ratio', norm_change / p_norm)
-        sig_p *= norm_change / p_norm * 2
+        p = p + (epsilon / 2) * (Z_proposal.detach() + 1/(sigma_y**2) * measurement_grad)
 
-        H_proposal = zeta * measurement_err.detach() + (1/2)* torch.sum(p * p, dim=(1, 2, 3))
+        H_proposal = (1/2) * torch.sum(Z_proposal**2, dim=(1, 2, 3)) + (1/(2 * sigma_y**2)) * measurement_err.detach() + (1/2)* torch.sum(p * p, dim=(1, 2, 3)) * m**(-1)
+        #print('Proposal error1', (1/2) * torch.sum(Z_proposal**2, dim=(1, 2, 3)).item(), 'error2', (1/(2 * sigma_y**2)) * measurement_err.detach().item(), 'error3', ((1/2)* torch.sum(p * p, dim=(1, 2, 3)) * m**(-1)).item())
 
         delta_H = H_proposal - H
         acceptance_ratio = min(torch.tensor([1], device=device), torch.exp(-delta_H))
-        accept = torch.rand(1).item() < acceptance_ratio.item()
-        print('Iteration:', iterator, 'H:', H.item(), 'H_proposal:', H_proposal.item())
-        print('Acceptance ratio:', acceptance_ratio.item(), 'result', accept)
+        if iterator > 30:
+            accept = torch.rand(1).item() < acceptance_ratio.item()
+            accept = True
+        else:
+            accept = True
+        print('Ratio:', (H_proposal/H).item() ,'Acceptance ratio:', acceptance_ratio.item(), 'result', accept)
         if accept:
             accepted += 1
             Z = Z_proposal.detach().clone().requires_grad_(True)
-            H = H_proposal.clone()
         else:
             continue
 
@@ -269,4 +277,5 @@ if __name__ == "__main__":
     logdir = os.path.join(opt.logdir, opt.task, opt.dataset, img)
     os.makedirs(logdir,exist_ok=True)
     # DMPlug
-    dmplug(model, scheduler, logdir, img=img, eta=opt.eta, tau=0.02, epsilon=0.002, zeta=60, cutoff=100, dataset=opt.dataset, img_model_config=img_model_config, task_config = task_config, device=device)
+
+    dmplug(model, scheduler, logdir, img=img, eta=opt.eta, tau=1.0, epsilon=0.1, sigma_y=0.4, m=1.0, cutoff=100, dataset=opt.dataset, img_model_config=img_model_config, task_config = task_config, device=device)
