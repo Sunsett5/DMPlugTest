@@ -4,7 +4,7 @@ intensity: 3.0
 
 measurement:
   operator:
-    name: blind_blur
+    name: gaussian_blur #blind_blur
   
   noise: 
     name: gaussian
