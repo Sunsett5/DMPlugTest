@@ -8,14 +8,14 @@ class DPS(Base_Algo):
         self.lam = lam
 
     @ torch.enable_grad()
-    def cal_x0(self, xt, t, at, at_next, y_0, classes=None):
+    def cal_x0(self, xt, t, at, at_next, y_0, noise='ddpm', classes=None):
         xt.requires_grad_(True)
         if self.cls_fn == None:
             et = self.model(xt, t)
         else:
             et = self.model(xt, t, self.classes)
             et = et[:, :3]
-            et = et - (1 - at).sqrt()[0,0,0,0] * self.cls_fn(x,t,self.classes)
+            et = et - (1 - at).sqrt()[0,0,0,0] * self.cls_fn(xt,t,self.classes)
         if et.size(1) == 6:
             et = et[:, :3]
         # et = et.clip(-1, 1)
@@ -28,13 +28,18 @@ class DPS(Base_Algo):
         loss = torch.sum(error**2)
         grad = torch.autograd.grad(outputs=loss, inputs=xt)[0]
         norm = torch.linalg.norm(grad)
-        c1 = self.eta * ((1-at[0,0,0,0]/at_next[0,0,0,0]) * (1-at_next[0,0,0,0])/(1-at[0,0,0,0])).sqrt()
+        if noise == 'ddpm':
+            c1 = self.eta * ((1-at[0,0,0,0]/at_next[0,0,0,0]) * (1-at_next[0,0,0,0])/(1-at[0,0,0,0])).sqrt()
+        elif noise == 'ddim':
+            c1 = 0
+        else:
+            raise ValueError("Unsupported noise type: {}".format(noise))
         c2 = (1-at_next[0,0,0,0] - c1**2).sqrt()
         vt = ((1-at_next[0,0,0,0]) / (1-at[0,0,0,0])) * (1 - at[0,0,0,0] / at_next[0,0,0,0])
         rt = (vt / (1+vt)).sqrt()
         # add_up = c1 * torch.randn_like(x0_t) + c2 * et + at.sqrt() * grad * 1.0
         add_up = c1 * torch.randn_like(x0_t) + c2 * et
-        x0_t -= at.sqrt() / at_next.sqrt() * grad * self.lam
+        x0_t -= 1 / at_next.sqrt() * grad * self.lam / loss.sqrt()
         return x0_t, add_up
     
     def map_back(self, x0_t, y_0, add_up, at_next, at):
