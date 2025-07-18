@@ -213,7 +213,7 @@ def init_algo(opt, model, H_funcs=None, sigma_0=0.01, deg=None, betas=None):
     elif opt.algo == 'dmps':
         algo = DMPS(model, H_funcs, sigma_0)
     elif opt.algo == 'resample':
-        gamma = 100
+        gamma = 40
         if 'celeba' in opt.config:
             if 'cs' in deg:
                 lam = 1.0
@@ -436,9 +436,7 @@ def sample_image(opt, config=None, model_config=None, device='cuda'):
 
         y_0 = H_funcs.H(x_orig).detach()
         y_0 = y_0 + sigma_0 * torch.randn_like(y_0)
-        # print(sigma_0)
         y_pinv = H_funcs.H_pinv(y_0).view(y_0.shape[0], config.data.channels, config.data.image_size, config.data.image_size)
-        # print(y_0.shape)
         os.makedirs(opt.image_folder, exist_ok=True)
 
         for i in range(len(y_0)):
@@ -471,6 +469,7 @@ def sample_image(opt, config=None, model_config=None, device='cuda'):
         elif opt.algo == 'dmplug_adam':
             xt = dmplug_adam(x, n, b, seq, seq_next, algo, opt, y_0, H_funcs, x_orig)
         elif opt.algo == 'hmc':
+            #xt = hmc(x, n, b, seq, seq_next, algo, opt, y_0, H_funcs, x_orig)
             xt = hmc(x, n, b, seq, seq_next, algo, opt, y_0, H_funcs, x_orig)
         else:
             with torch.no_grad():
@@ -484,11 +483,9 @@ def sample_image(opt, config=None, model_config=None, device='cuda'):
             )
             if i == len(x)-1 or i == -1:
                 orig = inverse_data_transform(config, x_orig[j])
-                # print(torch.norm(orig[0]))
                 mse = torch.mean((x[j].to(device) - orig) ** 2)
                 psnr = 10 * torch.log10(1 / mse)
                 avg_psnr += psnr
-                # print(x[j].shape)
                 avg_ssim += ssim(x[j].detach().cpu().numpy(), orig.detach().cpu().numpy(), data_range=x[j].detach().cpu().numpy().max() - x[j].detach().cpu().numpy().min(), channel_axis=0)
                 LPIPS = loss_fn_vgg(2*orig-1.0, 2*torch.tensor(x[j]).to(torch.float32).cuda()-1.0)
                 avg_lpips += LPIPS[0,0,0,0]
@@ -535,48 +532,51 @@ def dmplug_adam(x, n, b, seq, seq_next, algo, opt, y_0, H_funcs, x_orig):
         orig_pic.append(inverse_data_transform(config, x_orig[j]))
     psnr_list = []
 
-    epochs = 500
-    for epoch in tqdm(range(epochs)):
+    epochs = 400
+    for epoch in range(epochs):
         optimizer.zero_grad()
         xt = iterative_sampling(x, n, b, seq, seq_next, algo, opt, y_0, tqdm_disable=True).clip(-1, 1)
         x_save = [inverse_data_transform(config, y) for y in xt]
-        for j in range(len(x_save)):
-            tvu.save_image(
-                x_save[j], os.path.join(opt.image_folder, f"dmplug_{epoch}.png")
-            )
-            mse = torch.mean((x_save[j].to(device) - orig_pic[j]) ** 2)
-            psnr = 10 * torch.log10(1 / mse)
-            psnr_list.append(psnr.item())
-            print('PSNR:', psnr.item())
+        #for j in range(len(x_save)):
+            #tvu.save_image(
+            #    x_save[j], os.path.join(opt.image_folder, f"dmplug_{epoch}.png")
+            #)
+        #    mse = torch.mean((x_save[j].to(device) - orig_pic[j]) ** 2)
+        #    psnr = 10 * torch.log10(1 / mse)
+        #    psnr_list.append(psnr.item())
+        #    print('PSNR:', psnr.item())
         error = y_0 - H_funcs.H(xt)
         loss = torch.sum(error**2)
         loss.backward()
         optimizer.step()
 
     # plot the PSNR
-    fig, ax = plt.subplots(figsize=(10, 5))
+    """ fig, ax = plt.subplots(figsize=(10, 5))
     ax.plot(psnr_list, label='PSNR')
     ax.set_xlabel('Epoch')
     ax.set_ylabel('PSNR')
-    plt.savefig(os.path.join(opt.image_folder, 'dmplug_psnr.png'))
+    plt.savefig(os.path.join(opt.image_folder, 'dmplug_psnr.png')) """
 
     return xt.detach()
 
 def hmc(x, n, b, seq, seq_next, algo, opt, y_0, H_funcs, x_orig):
     x = x.requires_grad_()
-    L = max(1,math.floor(opt.tau/opt.epsilon))
-    epochs = 80
+    sigma_y = opt.sigma_y
+    tau = opt.tau
+    epsilon = opt.epsilon
+    L = max(1,math.floor(tau/epsilon))
+    prev_loss = float('inf')
+    epochs = 100
 
     orig_pic = []
     for j in range(len(x_orig)):
         orig_pic.append(inverse_data_transform(config, x_orig[j]))
     psnr_list = []
 
-    temp = opt.temp
-    accepted = 0
+    prev_delta = None
     rejected = 0
 
-    for epoch in tqdm(range(epochs)):
+    for epoch in range(epochs):
 
         # initialize momentum
         p = torch.randn_like(x, device=device) * math.sqrt(opt.m)
@@ -584,48 +584,65 @@ def hmc(x, n, b, seq, seq_next, algo, opt, y_0, H_funcs, x_orig):
         loss = torch.sum((y_0 - H_funcs.H(xt))**2)
         loss_grad = torch.autograd.grad(loss, x, retain_graph=False)[0]
 
-        H = (1/temp) * ((1/2) * torch.sum(x**2, dim=(1, 2, 3)) + (1/(2 * opt.sigma_y**2)) * loss.detach() + (1/2)* torch.sum(p * p, dim=(1, 2, 3)) * opt.m**(-1))
+        H = (1/2) * torch.sum(x**2, dim=(1, 2, 3)) + (1/(2 * sigma_y**2)) * loss.detach() + (1/2)* torch.sum(p * p, dim=(1, 2, 3)) * opt.m**(-1)
 
         x_proposal = x.detach().clone().requires_grad_(True)
 
         # update momentum
-        p = p - (1/temp) * (opt.epsilon / 2) * (x_proposal.detach() + 1/(2 * opt.sigma_y**2) * loss_grad)
+        p = p - (epsilon / 2) * (x_proposal.detach() + 1/(2 * sigma_y**2) * loss_grad)
 
         for l in range(L):
 
-            x_proposal = x_proposal + opt.epsilon * opt.m**(-1) * p 
+            x_proposal = x_proposal + epsilon * opt.m**(-1) * p 
             x_proposal = x_proposal.detach().requires_grad_(True)
 
             xt = iterative_sampling(x_proposal, n, b, seq, seq_next, algo, opt, y_0, tqdm_disable=True).clip(-1, 1)
             loss = torch.sum((y_0 - H_funcs.H(xt))**2)
             loss_grad = torch.autograd.grad(loss, x_proposal, retain_graph=False)[0]
 
-            p = p - (1/temp) * opt.epsilon * (x_proposal.detach() + 1/(2 * opt.sigma_y**2) * loss_grad)
+            p = p - epsilon * (x_proposal.detach() + 1/(2 * sigma_y**2) * loss_grad)
 
-        p = p + (1/temp) * (opt.epsilon / 2) * (x_proposal.detach() + 1/(2 * opt.sigma_y**2) * loss_grad)
+        p = p + (epsilon / 2) * (x_proposal.detach() + 1/(2 * sigma_y**2) * loss_grad)
 
-        H_proposal = (1/temp) * ((1/2) * torch.sum(x_proposal**2, dim=(1, 2, 3)) + (1/(2 * opt.sigma_y**2)) * loss.detach() + (1/2)* torch.sum(p * p, dim=(1, 2, 3)) * opt.m**(-1))
+        H_proposal = (1/2) * torch.sum(x_proposal**2, dim=(1, 2, 3)) + (1/(2 * sigma_y**2)) * loss.detach() + (1/2)* torch.sum(p * p, dim=(1, 2, 3)) * opt.m**(-1)
 
         delta_H = H_proposal - H
         acceptance_ratio = min(torch.tensor([1], device=device), torch.exp(-delta_H))
         accept = torch.rand(1).item() < acceptance_ratio.item()
-        print('Acceptance ratio:', acceptance_ratio.item(), 'Delta:', delta_H.item(), 'Accept:', accept)
+        #print('Acceptance ratio:', acceptance_ratio.item(), 'Delta:', delta_H.item(), 'Accept:', accept)
         if accept:
-            accepted += 1
             rejected = 0
-            if opt.annealed_temp:
-                opt.sigma_y = opt.sigma_y * 0.94
-                #opt.tau = opt.tau * 0.95
-                #opt.epsilon = opt.epsilon * 0.95
-                #L = max(1,math.floor(opt.tau/opt.epsilon))
+            if opt.annealed_temp and loss.detach().item() < prev_loss:
+                sigma_y = sigma_y * 0.85
+                prev_loss = loss.detach().item()
+                #tau = tau * 0.95
+                #epsilon = epsilon * 0.95
+                #L = max(1,math.floor(tau/epsilon))
 
+            current_delta = x_proposal.detach() - x.detach()
+            if prev_delta is not None:
+                cosine = torch.sum(prev_delta * current_delta, dim=(1, 2, 3)) / (torch.sum(prev_delta**2, dim=(1, 2, 3))**0.5 * torch.sum(current_delta**2, dim=(1, 2, 3))**0.5)
+                if cosine > -0.005:
+                    x_save = [inverse_data_transform(config, y) for y in xt]
+                    for j in range(len(x_save)):
+                        #tvu.save_image(
+                        #    x_save[j], os.path.join(opt.image_folder, f"hmc_{epoch}.png")
+                        #)
+                        mse = torch.mean((x_save[j].to(device) - orig_pic[j]) ** 2)
+                        psnr = 10 * torch.log10(1 / mse)
+                        psnr_list.append(psnr.item())
+                        print('PSNR almost:', psnr.item())
+                    return x_accept
+                
+            x_accept = xt.detach().clone()
+            prev_delta = current_delta.clone()
             x = x_proposal.detach().clone().requires_grad_(True)
             x_save = [inverse_data_transform(config, y) for y in xt]
 
             for j in range(len(x_save)):
-                tvu.save_image(
-                    x_save[j], os.path.join(opt.image_folder, f"hmc_{epoch}.png")
-                )
+                #tvu.save_image(
+                #    x_save[j], os.path.join(opt.image_folder, f"hmc_{epoch}.png")
+                #)
                 mse = torch.mean((x_save[j].to(device) - orig_pic[j]) ** 2)
                 psnr = 10 * torch.log10(1 / mse)
                 psnr_list.append(psnr.item())
@@ -633,11 +650,111 @@ def hmc(x, n, b, seq, seq_next, algo, opt, y_0, H_funcs, x_orig):
         else:
             rejected += 1
             if rejected > 2:
-                opt.tau = opt.tau * 0.9
-                opt.epsilon = opt.epsilon * 0.9
-                L = max(1,math.floor(opt.tau/opt.epsilon))
+                tau = tau * 0.8
+                epsilon = epsilon * 0.8
+                L = max(1,math.floor(tau/epsilon))
                 rejected = 0
-                print('Reducing tau and epsilon, new tau:', opt.tau, 'new epsilon:', opt.epsilon, 'new L:', L)
+            continue
+
+    # plot the PSNR
+    """ fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(psnr_list, label='PSNR')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('PSNR')
+    plt.savefig(os.path.join(opt.image_folder, 'hmc_psnr.png')) """
+
+    if opt.refine:
+        xt = dmplug_adam(x, n, b, seq, seq_next, algo, opt, y_0, H_funcs, x_orig)
+
+    return x_accept
+
+def hmc_deferred(x, n, b, seq, seq_next, algo, opt, y_0, H_funcs, x_orig):
+    x = x.requires_grad_()
+    sigma_y = opt.sigma_y
+    tau = opt.tau
+    epsilon = opt.epsilon
+    L = max(1,math.floor(tau/epsilon))
+    prev_loss = float('inf')
+    queue = []
+    epochs = 600
+
+    orig_pic = []
+    for j in range(len(x_orig)):
+        orig_pic.append(inverse_data_transform(config, x_orig[j]))
+    psnr_list = []
+
+    rejected = 0
+
+    for epoch in range(epochs):
+
+        # initialize momentum
+        p = torch.randn_like(x, device=device) * math.sqrt(opt.m)
+        xt = iterative_sampling(x, n, b, seq, seq_next, algo, opt, y_0, tqdm_disable=True).clip(-1, 1)
+        loss = torch.sum((y_0 - H_funcs.H(xt))**2)
+        loss_grad = torch.autograd.grad(loss, x, retain_graph=False)[0]
+
+        H = (1/2) * torch.sum(x**2, dim=(1, 2, 3)) + (1/(2 * sigma_y**2)) * loss.detach() + (1/2)* torch.sum(p * p, dim=(1, 2, 3)) * opt.m**(-1)
+
+        x_proposal = x.detach().clone().requires_grad_(True)
+
+        # update momentum
+        p = p - (epsilon / 2) * (x_proposal.detach() + 1/(2 * sigma_y**2) * loss_grad)
+
+        for l in range(L):
+            print(x_proposal.shape)
+            x_proposal = x_proposal + epsilon * opt.m**(-1) * p 
+            x_proposal = x_proposal.detach().requires_grad_(True)
+
+            xt = iterative_sampling(x_proposal, n, b, seq, seq_next, algo, opt, y_0, tqdm_disable=True).clip(-1, 1)
+            loss = torch.sum((y_0 - H_funcs.H(xt))**2)
+            loss_grad = torch.autograd.grad(loss, x_proposal, retain_graph=False)[0]
+
+            p = p - epsilon * (x_proposal.detach() + 1/(2 * sigma_y**2) * loss_grad)
+
+        p = p + (epsilon / 2) * (x_proposal.detach() + 1/(2 * sigma_y**2) * loss_grad)
+
+        H_proposal = (1/2) * torch.sum(x_proposal**2, dim=(1, 2, 3)) + (1/(2 * sigma_y**2)) * loss.detach() + (1/2)* torch.sum(p * p, dim=(1, 2, 3)) * opt.m**(-1)
+
+        delta_H = H_proposal - H
+        acceptance_ratio = min(torch.tensor([1], device=device), torch.exp(-delta_H))
+        accept = torch.rand(1).item() < acceptance_ratio.item()
+        #print('Acceptance ratio:', acceptance_ratio.item(), 'Delta:', delta_H.item(), 'Accept:', accept)
+        if accept:
+            rejected = 0
+            #x = x_proposal.detach().clone().requires_grad_(True)
+            queue.append((x_proposal.detach().clone(), xt.detach().clone(), loss.detach().item()))
+            if len(queue) > 5:
+                # find the best proposal
+                best_loss = float('inf')
+                best_x = None
+                best_xt = None
+                for proposal_x, proposal_xt, proposal_loss in queue:
+                    if proposal_loss < best_loss:
+                        best_loss = proposal_loss
+                        best_x = proposal_x
+                        best_xt = proposal_xt
+                xt_accept = best_xt.detach().clone()
+                x = best_x.detach().clone().requires_grad_(True)
+                sigma_y = sigma_y * 0.85
+                queue = []
+            
+                x_save = [inverse_data_transform(config, y) for y in xt_accept]
+
+                for j in range(len(x_save)):
+                    #tvu.save_image(
+                    #    x_save[j], os.path.join(opt.image_folder, f"hmc_{epoch}.png")
+                    #)
+                    mse = torch.mean((x_save[j].to(device) - orig_pic[j]) ** 2)
+                    psnr = 10 * torch.log10(1 / mse)
+                    psnr_list.append(psnr.item())
+                    print('PSNR:', psnr.item())
+        else:
+            rejected += 1
+            if rejected > 2:
+                tau = tau * 0.9
+                epsilon = epsilon * 0.9
+                L = max(1,math.floor(tau/epsilon))
+                rejected = 0
             continue
 
     # plot the PSNR
@@ -650,7 +767,24 @@ def hmc(x, n, b, seq, seq_next, algo, opt, y_0, H_funcs, x_orig):
     if opt.refine:
         xt = dmplug_adam(x, n, b, seq, seq_next, algo, opt, y_0, H_funcs, x_orig)
 
-    return xt.detach()
+    return xt_accept
+
+def orthogonal_component(A, B):
+    # Flatten all but batch dimension
+    A_flat = A.view(A.shape[0], -1)  # shape: [1, 3*256*256]
+    B_flat = B.view(B.shape[0], -1)
+
+    # Compute inner products and projection
+    inner_prod = torch.sum(B_flat * A_flat, dim=1, keepdim=True)  # shape: [1, 1]
+    norm_A2 = torch.sum(A_flat * A_flat, dim=1, keepdim=True)     # shape: [1, 1]
+
+    # Compute projection of B onto A
+    proj = (inner_prod / norm_A2) * A_flat  # shape: [1, 3*256*256]
+
+    # Reshape and subtract
+    proj = proj.view_as(A)
+    B_perp = B - proj
+    return B_perp
 
 def iterative_sampling(xt, n, b, seq, seq_next, algo, opt, y_0, tqdm_disable=False):
 
@@ -675,7 +809,7 @@ def iterative_sampling(xt, n, b, seq, seq_next, algo, opt, y_0, tqdm_disable=Fal
 def get_parser():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--seed", type=int, default=1234, help="Random seed")
+    parser.add_argument("--seed", type=int, default=5678, help="Random seed")
     parser.add_argument(
         "--exp", type=str, default="exp", help="Path for saving running related data."
     )
@@ -717,9 +851,6 @@ def get_parser():
     )
     parser.add_argument(
         "--m", type=float, help="Mass Matrix Variance", default=1.0
-    )
-    parser.add_argument(
-        "--temp", type=float, default=1.0, help="Starting Temperature for HMC sampling"
     )
     parser.add_argument(
         "--annealed_temp", action="store_true", default=False, help="Anneal the temperature during HMC sampling"
